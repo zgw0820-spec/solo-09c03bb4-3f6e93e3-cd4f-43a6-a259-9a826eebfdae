@@ -4,7 +4,7 @@
 <div class="card" id="status-card">
   <h2>作业 <code>{{ job.job_id[:12] }}</code></h2>
   <p>
-    状态：
+    配对状态：
     {% if job.phase == 'done' %}<span class="badge b-done">已完成</span>
     {% elif job.phase == 'failed' %}<span class="badge b-fail">失败</span>
     {% elif job.running %}<span class="badge b-run">运行中（{{ job.phase }}）</span>
@@ -33,6 +33,129 @@
   </p>
   <p><a href="{{ url_for('index') }}">← 返回首页</a></p>
 </div>
+
+{% if job.flash %}
+<div class="card flash {{ 'flash-err' if job.flash_kind == 'err' else 'flash-ok' }}">
+  <strong>{{ '操作被拒绝' if job.flash_kind == 'err' else '操作结果' }}：</strong>{{ job.flash }}
+</div>
+{% endif %}
+
+{% if job.phase == 'done' %}
+<div class="card" id="prewarm-card">
+  <h2>镜像层预热批次（每个作业仅一批）</h2>
+
+  {% if not job.prewarm %}
+  {# ---------------- 建批表单 ---------------- #}
+  <p class="muted">
+    选择一台目标构建机，上传含 <code>层摘要, 字节数</code> 的层大小 CSV，
+    填写本轮拉取上限（字节，支持 1024 / 2mb / 3GiB 写法），然后建立本作业唯一的预热批次。
+  </p>
+  {% if job.machines %}
+  <form action="{{ url_for('create_prewarm_batch', job_id=job.job_id) }}"
+        method="post" enctype="multipart/form-data">
+    <label>目标机构建机（来自作业缓存表，已有层免计）</label>
+    <select name="target" required>
+      {% for m in job.machines %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
+    </select>
+    <label>本轮拉取上限（字节）</label>
+    <input type="text" name="budget" placeholder="例如 10485760 或 10mb" required>
+    <label>层大小 CSV（层摘要 + 字节数）</label>
+    <input type="file" name="sizes_csv" accept=".csv,text/csv" required>
+    <button type="submit">建立预热批次</button>
+  </form>
+  {% else %}
+  <p class="muted">作业缓存表中没有可用的目标机，无法建立批次。</p>
+  {% endif %}
+  {% else %}
+  {# ---------------- 批次详情与操作 ---------------- #}
+  {% set pw = job.prewarm %}
+  <table>
+    <tr><th>目标机</th><td><code>{{ pw.target }}</code>（缓存表已有层免计）</td></tr>
+    <tr><th>本轮拉取上限</th><td>{{ pw.budget }} 字节</td></tr>
+    <tr><th>已放行待拉总量</th>
+        <td><b id="pw-used">{{ pw.used_bytes }}</b> / {{ pw.budget }} 字节
+            （剩余 {{ pw.remaining_bytes }} 字节）</td></tr>
+    <tr><th>等候顺序（FIFO）</th>
+        <td>{% if pw.queue %}{{ pw.queue | join(' → ') }}{% else %}<span class="muted">空</span>{% endif %}</td></tr>
+    <tr><th>队首阻塞</th>
+        <td>{% if pw.blocked_by %}<code>{{ pw.blocked_by }}</code> 剩余预算不够，其后任务继续等候
+            {% else %}无{% endif %}</td></tr>
+  </table>
+
+  <h3 style="margin-top:18px">入批任务（{{ pw.admitted|length }}）</h3>
+  {% if pw.admitted_tasks %}
+  <table>
+    <tr><th>任务号</th><th>待拉缺层</th><th>独占口径待拉字节</th><th>操作</th></tr>
+    {% for t in pw.admitted_tasks %}
+    <tr>
+      <td><code>{{ t.task_id }}</code></td>
+      <td>{{ t.missing_layers | join(', ') if t.missing_layers else '（全部已在目标机缓存，免计）' }}</td>
+      <td>{{ t.own_bytes }}</td>
+      <td>
+        <form action="{{ url_for('prewarm_cancel', job_id=job.job_id) }}" method="post" style="display:inline">
+          <input type="hidden" name="task_id" value="{{ t.task_id }}">
+          <button type="submit" class="btn-small">撤销</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">暂无入批任务。</p>{% endif %}
+
+  <h3>等候中任务（{{ pw.waiting_tasks|length }}）</h3>
+  {% if pw.waiting_tasks %}
+  <table>
+    <tr><th>排队顺序</th><th>任务号</th><th>待拉缺层</th><th>独占口径待拉字节</th><th>操作</th></tr>
+    {% for t in pw.waiting_tasks %}
+    <tr>
+      <td>{{ loop.index }}</td>
+      <td><code>{{ t.task_id }}</code></td>
+      <td>{{ t.missing_layers | join(', ') }}</td>
+      <td>{{ t.own_bytes }}</td>
+      <td>
+        <form action="{{ url_for('prewarm_cancel', job_id=job.job_id) }}" method="post" style="display:inline">
+          <input type="hidden" name="task_id" value="{{ t.task_id }}">
+          <button type="submit" class="btn-small">撤销</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">队列为空。</p>{% endif %}
+
+  <h3>本轮待拉层清单（共用缺层只计一次，{{ pw.required_layers|length }} 层）</h3>
+  {% if pw.required_layers %}
+  <table>
+    <tr><th>层摘要</th><th>字节数</th><th>被哪些入批任务共用</th></tr>
+    {% for layer in pw.required_layers %}
+    <tr><td><code>{{ layer.digest }}</code></td><td>{{ layer.bytes }}</td>
+        <td>{{ layer.shared_by | join(', ') }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">当前入批任务没有需要拉取的缺层。</p>{% endif %}
+
+  <h3>申请入批 / 撤销</h3>
+  <form action="{{ url_for('prewarm_apply', job_id=job.job_id) }}" method="post" style="display:inline">
+    <input type="text" name="task_id" placeholder="任务号" required>
+    <button type="submit">申请入批</button>
+  </form>
+  <span class="muted">重复申请沿用已有登记，不改变排队顺序。</span>
+
+  {% if pw.last_result %}
+  <p class="muted" style="margin-top:10px">
+    最近一次成功结果（已落盘，重启后仍可查）：
+    <code>{{ pw.last_result.op }}/{{ pw.last_result.task_id }}/{{ pw.last_result.kind }}</code>
+    — {{ pw.last_result.message }}
+  </p>
+  {% endif %}
+  {% endif %}
+</div>
+{% elif job.phase != 'failed' %}
+<div class="card">
+  <h2>镜像层预热批次</h2>
+  <p class="muted">配对作业完成后，才能在本页选择目标机并安排预热批次。</p>
+</div>
+{% endif %}
 
 {% if job.phase != 'done' and job.phase != 'failed' %}
 <script>

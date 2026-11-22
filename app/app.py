@@ -11,6 +11,7 @@ from typing import Dict
 from flask import (Flask, Response, abort, redirect, render_template,
                    request, send_file, url_for)
 
+import prewarm
 from join_engine import (FINAL_RESULT_FILE, STATE_FILE, JoinError,
                          count_pairs_on_disk, load_state,
                          read_csv_header, run_join)
@@ -61,6 +62,26 @@ def _job_summary(job_id: str) -> dict:
     with _jobs_lock:
         state["running"] = job_id in _threads and _threads[job_id].is_alive()
     return state
+
+
+def _prewarm_context(job_id: str) -> dict:
+    """预热面板所需数据：目标机列表（来自作业缓存表）、批次快照。"""
+    jdir = _job_dir(job_id)
+    try:
+        machines = sorted(prewarm.load_machine_layers(jdir).keys())
+    except prewarm.PrewarmError:
+        machines = []
+    return {
+        "machines": machines,
+        "prewarm": prewarm.summary(jdir),
+    }
+
+
+def _require_done_job(jdir: str) -> None:
+    """预热批次只能在已完成的配对作业页建立/操作。"""
+    state = load_state(jdir)
+    if state.get("phase") != "done":
+        abort(409, description="配对作业尚未完成，暂不能安排预热批次。")
 
 
 def _run_job_thread(job_id: str) -> None:
@@ -149,7 +170,88 @@ def upload() -> Response:
 @app.get("/jobs/<job_id>")
 def job_detail(job_id: str) -> str:
     summary = _job_summary(job_id)
+    summary.update(_prewarm_context(job_id))
+    summary["flash"] = request.args.get("msg")
+    summary["flash_kind"] = request.args.get("kind", "ok")
     return render_template("job.html", job=summary)
+
+
+# --------------------------------------------------------------------------- #
+# 预热批次：建批 / 申请入批 / 撤销（每个作业只建一批）
+# --------------------------------------------------------------------------- #
+def _back_to_job(job_id: str, message: str, kind: str = "ok") -> Response:
+    """操作后回到作业页，通过查询串携带一次性提示（刷新即消失）。"""
+    from urllib.parse import quote
+    return redirect(
+        url_for("job_detail", job_id=job_id)
+        + f"?msg={quote(message)}&kind={quote(kind)}")
+
+
+@app.post("/jobs/<job_id>/prewarm/batch")
+def create_prewarm_batch(job_id: str) -> Response:
+    jdir = _job_dir(job_id)
+    _require_done_job(jdir)
+    target = (request.form.get("target") or "").strip()
+    budget_raw = (request.form.get("budget") or "").strip()
+    upload = request.files.get("sizes_csv")
+    if upload is None or not upload.filename:
+        return render_template(
+            "error.html", message="需要上传含层摘要和字节数的 CSV。"), 400
+    # 按安全约定，不可信上传先完整落到独立临时文件，再以路径传参解析
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(prefix=".sizes-upload-", suffix=".csv")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(upload.read())
+        with open(tmp_path, "r", encoding="utf-8-sig", newline="") as fh:
+            sizes_text = fh.read()
+        try:
+            prewarm.create_batch(jdir, target, budget_raw, sizes_text)
+        except prewarm.PrewarmError as exc:
+            return render_template("error.html", message=str(exc)), exc.status
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    return _back_to_job(
+        job_id,
+        f"预热批次已建立：目标机 {target}，本轮拉取上限 {budget_raw}")
+
+
+@app.post("/jobs/<job_id>/prewarm/apply")
+def prewarm_apply(job_id: str) -> Response:
+    jdir = _job_dir(job_id)
+    _require_done_job(jdir)
+    task_id = (request.form.get("task_id") or "").strip()
+    try:
+        prewarm.apply_task(jdir, task_id)
+    except prewarm.PrewarmError as exc:
+        # 拒绝原因（未知大小 / 单任务超预算 / 非本作业任务）回页面展示
+        return _back_to_job(job_id, str(exc), kind="err")
+    snap = prewarm.summary(jdir)
+    return _back_to_job(job_id, snap["last_result"]["message"])
+
+
+@app.post("/jobs/<job_id>/prewarm/cancel")
+def prewarm_cancel(job_id: str) -> Response:
+    jdir = _job_dir(job_id)
+    _require_done_job(jdir)
+    task_id = (request.form.get("task_id") or "").strip()
+    try:
+        prewarm.cancel_task(jdir, task_id)
+    except prewarm.PrewarmError as exc:
+        return _back_to_job(job_id, str(exc), kind="err")
+    snap = prewarm.summary(jdir)
+    return _back_to_job(job_id, snap["last_result"]["message"])
+
+
+@app.get("/jobs/<job_id>/prewarm/status")
+def prewarm_status(job_id: str) -> Response:
+    from flask import jsonify
+    jdir = _job_dir(job_id)
+    snap = prewarm.summary(jdir)
+    if snap is None:
+        return jsonify({"exists": False}), 404
+    return jsonify(snap)
 
 
 @app.get("/jobs/<job_id>/download")
